@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+from collections.abc import Mapping
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
 from pathlib import Path
@@ -100,6 +101,12 @@ class AzureContentUnderstandingError(ContentUnderstandingError):
 
 
 @dataclass(frozen=True)
+class _CapturedAnalysisResponse:
+    result: Any
+    raw_response: dict[str, Any]
+
+
+@dataclass(frozen=True)
 class ContentUnderstandingSettings:
     endpoint: str
     key: str | None
@@ -160,15 +167,19 @@ class ContentUnderstandingService:
 
         client = None
         credential = None
+        poller = None
         try:
             client, credential = self._create_client()
             poller = client.begin_analyze_binary(
                 analyzer_id=self.settings.analyzer_id,
                 binary_input=file_bytes,
                 content_type=detected_content_type,
+                cls=_capture_analysis_response,
             )
-            result = poller.result(timeout=90)
-            return self._build_result(result, file_name, detected_content_type)
+            captured = poller.result(timeout=90)
+            result = captured.result if isinstance(captured, _CapturedAnalysisResponse) else captured
+            raw_response = captured.raw_response if isinstance(captured, _CapturedAnalysisResponse) else {}
+            return self._build_result(result, file_name, detected_content_type, raw_response)
         except (InvalidContentError, EmptyContentUnderstandingResult):
             raise
         except FuturesTimeoutError as exc:
@@ -252,9 +263,10 @@ class ContentUnderstandingService:
         result: Any,
         file_name: str,
         content_type: str,
+        raw_response: dict[str, Any] | None = None,
     ) -> ContentUnderstandingResult:
-        raw_result = _to_plain_data(result)
-        markdown = _extract_llm_ready_text(result)
+        raw_result = _analysis_payload(raw_response) or _to_plain_mapping(result)
+        markdown = _extract_llm_ready_text(result, raw_result)
         analyzer_fields = _collect_field_values(result, raw_result)
         knowledge = _extract_course_knowledge(analyzer_fields, markdown)
         warnings = _normalize_list(raw_result.get("warnings", []))
@@ -278,22 +290,170 @@ class ContentUnderstandingService:
         )
 
 
-def _extract_llm_ready_text(result: Any) -> str:
+def _capture_analysis_response(pipeline_response: Any, result: Any, _headers: Any) -> _CapturedAnalysisResponse:
+    try:
+        raw_response = pipeline_response.http_response.json()
+    except Exception:
+        raw_response = {}
+    return _CapturedAnalysisResponse(result=result, raw_response=_to_plain_mapping(raw_response))
+
+
+def _extract_llm_ready_text(result: Any, raw_result: dict[str, Any] | None = None) -> str:
     if to_llm_input is not None:
         try:
             text = to_llm_input(result)
-            if isinstance(text, str) and text.strip():
+            if isinstance(text, str) and _has_substantive_text(text):
                 return text
         except Exception:
             pass
 
+    raw_result = raw_result or _to_plain_mapping(result)
+    raw_text = _extract_text_from_raw_result(raw_result)
+    if raw_text.strip():
+        return raw_text
+
     contents = getattr(result, "contents", None) or []
-    markdown_parts = []
+    markdown_parts: list[str] = []
     for content in contents:
-        markdown = getattr(content, "markdown", "")
-        if markdown:
-            markdown_parts.append(str(markdown))
+        markdown_parts.extend(_extract_text_from_content(content))
     return "\n\n".join(markdown_parts)
+
+
+def _has_substantive_text(text: str) -> bool:
+    if not text.strip():
+        return False
+    body = _strip_front_matter(text).strip()
+    return bool(body or re.search(r"(?m)^\s*fields\s*:", text))
+
+
+def _extract_text_from_raw_result(raw_result: dict[str, Any]) -> str:
+    payload = _analysis_payload(raw_result)
+    parts: list[str] = []
+    raw_contents = payload.get("contents") if isinstance(payload, dict) else None
+
+    if isinstance(raw_contents, list):
+        for content in raw_contents:
+            parts.extend(_extract_text_from_content(content))
+    elif isinstance(payload, dict):
+        parts.extend(_extract_text_from_content(payload))
+
+    return "\n\n".join(_dedupe_text_blocks(parts))
+
+
+def _extract_text_from_content(content: Any) -> list[str]:
+    markdown = _value_for(content, "markdown")
+    if isinstance(markdown, str) and markdown.strip():
+        return [markdown]
+
+    parts = _extract_paragraph_text(_value_for(content, "paragraphs"))
+    if parts:
+        return parts
+
+    parts = _extract_page_text(_value_for(content, "pages"))
+    if parts:
+        return parts
+
+    parts = _extract_table_text(_value_for(content, "tables"))
+    if parts:
+        return parts
+
+    text = _value_for(content, "content", "text")
+    if isinstance(text, str) and text.strip():
+        return [text]
+    return []
+
+
+def _extract_paragraph_text(paragraphs: Any) -> list[str]:
+    if not isinstance(paragraphs, (list, tuple)):
+        return []
+
+    parts: list[str] = []
+    for paragraph in paragraphs:
+        text = _value_for(paragraph, "content", "text")
+        if not isinstance(text, str) or not text.strip():
+            continue
+        role = str(_value_for(paragraph, "role") or "").lower()
+        if "title" in role:
+            parts.append(f"# {text}")
+        elif "heading" in role:
+            parts.append(f"## {text}")
+        else:
+            parts.append(text)
+    return parts
+
+
+def _extract_page_text(pages: Any) -> list[str]:
+    if not isinstance(pages, (list, tuple)):
+        return []
+
+    parts: list[str] = []
+    for page in pages:
+        line_texts = [
+            text
+            for line in (_value_for(page, "lines") or [])
+            if isinstance((text := _value_for(line, "content", "text")), str) and text.strip()
+        ]
+        if line_texts:
+            page_text = "\n".join(line_texts)
+        else:
+            word_texts = [
+                text
+                for word in (_value_for(page, "words") or [])
+                if isinstance((text := _value_for(word, "content", "text")), str) and text.strip()
+            ]
+            page_text = " ".join(word_texts)
+
+        if page_text.strip():
+            page_number = _value_for(page, "pageNumber", "page_number")
+            marker = f"<!-- InputPageNumber: {page_number} -->\n\n" if page_number else ""
+            parts.append(marker + page_text)
+    return parts
+
+
+def _extract_table_text(tables: Any) -> list[str]:
+    if not isinstance(tables, (list, tuple)):
+        return []
+
+    parts: list[str] = []
+    for table in tables:
+        cells = _value_for(table, "cells") or []
+        rows: dict[int, dict[int, str]] = {}
+        for cell in cells:
+            text = _value_for(cell, "content", "text")
+            row_index = _value_for(cell, "rowIndex", "row_index")
+            column_index = _value_for(cell, "columnIndex", "column_index")
+            if not isinstance(text, str) or row_index is None or column_index is None:
+                continue
+            rows.setdefault(int(row_index), {})[int(column_index)] = _clean_text(text)
+        for row_index in sorted(rows):
+            row_values = [value for _, value in sorted(rows[row_index].items()) if value]
+            if row_values:
+                parts.append(" | ".join(row_values))
+    return parts
+
+
+def _iter_raw_field_sets(raw_result: dict[str, Any]) -> list[Mapping[str, Any]]:
+    field_sets: list[Mapping[str, Any]] = []
+
+    def walk(value: Any, depth: int = 0) -> None:
+        if depth > 10:
+            return
+        if isinstance(value, Mapping):
+            fields = value.get("fields")
+            if isinstance(fields, Mapping):
+                field_sets.append(fields)
+            for key in ("fieldValues", "extractedFields"):
+                alternate_fields = value.get(key)
+                if isinstance(alternate_fields, Mapping):
+                    field_sets.append(alternate_fields)
+            for child in value.values():
+                walk(child, depth + 1)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child, depth + 1)
+
+    walk(_analysis_payload(raw_result))
+    return field_sets
 
 
 def _extract_course_knowledge(field_values: dict[str, Any], markdown: str) -> CourseKnowledge:
@@ -349,12 +509,7 @@ def _collect_field_values(result: Any, raw_result: dict[str, Any]) -> dict[str, 
             for key, value in fields.items():
                 _set_field(collected, key, _field_value(value))
 
-    raw_contents = raw_result.get("contents", [])
-    if not raw_contents and isinstance(raw_result.get("result"), dict):
-        raw_contents = raw_result["result"].get("contents", [])
-
-    for content in raw_contents or []:
-        fields = content.get("fields", {}) if isinstance(content, dict) else {}
+    for fields in _iter_raw_field_sets(raw_result):
         for key, value in fields.items():
             if key not in collected:
                 _set_field(collected, key, _field_value(value))
@@ -378,34 +533,48 @@ def _field_value(field: Any) -> Any:
         return field
     if isinstance(field, (list, tuple, set)):
         return [_field_value(item) for item in field]
-    if isinstance(field, dict):
+    if isinstance(field, Mapping):
         if "valueArray" in field and isinstance(field["valueArray"], list):
             return [_field_value(item) for item in field["valueArray"]]
-        if "valueObject" in field and isinstance(field["valueObject"], dict):
+        if "valueObject" in field and isinstance(field["valueObject"], Mapping):
             return {key: _field_value(value) for key, value in field["valueObject"].items()}
         for key in (
-            "value",
+            "valueJson",
             "valueString",
-            "valueArray",
-            "valueObject",
             "valueNumber",
+            "valueInteger",
+            "valueBoolean",
             "valueDate",
+            "valueTime",
+            "value",
             "content",
+            "text",
         ):
-            if key in field:
+            if key in field and not _is_empty_value(field[key]):
                 return _field_value(field[key])
-        return {key: _field_value(value) for key, value in field.items()}
+        return {
+            key: _field_value(value)
+            for key, value in field.items()
+            if key not in {"type", "fieldType", "confidence", "source", "span"}
+        }
     for attr in (
-        "value",
-        "value_string",
         "value_array",
         "value_object",
+        "value_json",
+        "value_string",
         "value_number",
+        "value_integer",
+        "value_boolean",
         "value_date",
+        "value_time",
+        "value",
         "content",
+        "text",
     ):
         if hasattr(field, attr):
-            return _field_value(getattr(field, attr))
+            value = getattr(field, attr)
+            if not _is_empty_value(value):
+                return _field_value(value)
     return str(field)
 
 
@@ -534,15 +703,16 @@ def _first_value(value: Any) -> str:
 
 
 def _infer_title(markdown: str) -> str:
-    if not markdown.strip():
+    body = _strip_front_matter(markdown)
+    if not body.strip():
         return ""
 
     for pattern in (r"^\s*#\s+(.+)$", r"^\s*title:\s*(.+)$"):
-        match = re.search(pattern, markdown, flags=re.IGNORECASE | re.MULTILINE)
+        match = re.search(pattern, body, flags=re.IGNORECASE | re.MULTILINE)
         if match:
             return _clean_text(match.group(1))[:120]
 
-    for line in markdown.splitlines():
+    for line in body.splitlines():
         cleaned = _clean_text(line)
         if cleaned and len(cleaned) <= 120 and not cleaned.startswith("<!--"):
             return cleaned
@@ -550,12 +720,14 @@ def _infer_title(markdown: str) -> str:
 
 
 def _infer_topics(markdown: str) -> list[str]:
-    headings = re.findall(r"^\s{0,3}#{1,4}\s+(.+)$", markdown, flags=re.MULTILINE)
+    body = _strip_front_matter(markdown)
+    headings = re.findall(r"^\s{0,3}#{1,4}\s+(.+)$", body, flags=re.MULTILINE)
     cleaned = [_clean_text(heading) for heading in headings]
     return _dedupe([item for item in cleaned if 3 <= len(item) <= 120], limit=12)
 
 
 def _infer_objectives(markdown: str) -> list[str]:
+    body = _strip_front_matter(markdown)
     objective_lines = []
     keywords = (
         "objective",
@@ -565,7 +737,7 @@ def _infer_objectives(markdown: str) -> list[str]:
         "students will",
         "able to",
     )
-    for line in markdown.splitlines():
+    for line in body.splitlines():
         cleaned = _clean_text(line)
         lowered = cleaned.lower()
         if cleaned and any(keyword in lowered for keyword in keywords):
@@ -574,12 +746,13 @@ def _infer_objectives(markdown: str) -> list[str]:
 
 
 def _infer_key_terms(markdown: str) -> list[str]:
-    terms = re.findall(r"\*\*([^*\n]{3,80})\*\*", markdown)
-    terms.extend(re.findall(r"^\s*[-*]\s*([A-Z][A-Za-z0-9 /-]{2,80}):", markdown, flags=re.MULTILINE))
+    body = _strip_front_matter(markdown)
+    terms = re.findall(r"\*\*([^*\n]{3,80})\*\*", body)
+    terms.extend(re.findall(r"^\s*[-*]\s*([A-Z][A-Za-z0-9 /-]{2,80}):", body, flags=re.MULTILINE))
 
     glossary_block = re.search(
         r"(?:key terms|glossary)\s*(.*?)(?:\n#{1,4}\s+|\Z)",
-        markdown,
+        body,
         flags=re.IGNORECASE | re.DOTALL,
     )
     if glossary_block:
@@ -624,6 +797,68 @@ def _normalize_key(value: str) -> str:
     return re.sub(r"[^a-z0-9]", "", value.lower())
 
 
+def _value_for(source: Any, *names: str) -> Any:
+    if source is None:
+        return None
+    if isinstance(source, Mapping):
+        for name in names:
+            if name in source:
+                return source[name]
+    for name in names:
+        if hasattr(source, name):
+            return getattr(source, name)
+    return None
+
+
+def _is_empty_value(value: Any) -> bool:
+    return value is None or value == "" or value == [] or value == {}
+
+
+def _dedupe_text_blocks(values: list[str]) -> list[str]:
+    seen = set()
+    deduped = []
+    for value in values:
+        text = str(value).strip()
+        key = re.sub(r"\s+", " ", text).lower()
+        if text and key not in seen:
+            seen.add(key)
+            deduped.append(text)
+    return deduped
+
+
+def _strip_front_matter(text: str) -> str:
+    return re.sub(r"\A\s*---\s*.*?\s*---\s*", "", text, flags=re.DOTALL)
+
+
+def _analysis_payload(value: Any) -> dict[str, Any]:
+    data = _to_plain_mapping(value)
+    if not data:
+        return {}
+
+    for key in ("result", "analyzeResult", "analysisResult"):
+        nested = data.get(key)
+        if isinstance(nested, Mapping) and nested:
+            payload = _analysis_payload(nested)
+            if payload:
+                return payload
+
+    if any(key in data for key in ("contents", "fields", "warnings", "usage")):
+        return data
+
+    for nested in data.values():
+        if isinstance(nested, Mapping) and any(
+            key in nested for key in ("contents", "fields", "warnings", "usage")
+        ):
+            return _analysis_payload(nested)
+
+    return data
+
+
+def _to_plain_mapping(value: Any) -> dict[str, Any]:
+    plain = _to_plain_data(value)
+    return plain if isinstance(plain, dict) else {}
+
+
 def _first_env(*names: str) -> str:
     for name in names:
         value = os.getenv(name, "").strip()
@@ -635,7 +870,7 @@ def _first_env(*names: str) -> str:
 def _to_plain_data(value: Any) -> Any:
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
-    if isinstance(value, dict):
+    if isinstance(value, Mapping):
         return {str(key): _to_plain_data(item) for key, item in value.items()}
     if isinstance(value, (list, tuple, set)):
         return [_to_plain_data(item) for item in value]
