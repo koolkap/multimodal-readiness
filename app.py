@@ -94,9 +94,9 @@ def _render_sidebar(
         disabled=True,
     )
     st.sidebar.text_input(
-        "Content Understanding Key",
+        "Content Understanding Resource Key",
         value=_masked_secret(cu_settings.key),
-        type="password",
+        type="password" if cu_settings.key else "default",
         disabled=True,
         help="Loaded from CONTENTUNDERSTANDING_KEY, CONTENT_UNDERSTANDING_KEY, or Azure credential fallback.",
     )

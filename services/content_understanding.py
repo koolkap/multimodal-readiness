@@ -356,8 +356,10 @@ def _lookup_field(fields: dict[str, Any], aliases: list[str]) -> Any:
 def _field_value(field: Any) -> Any:
     if field is None:
         return None
-    if isinstance(field, (str, int, float, bool, list, tuple)):
+    if isinstance(field, (str, int, float, bool)):
         return field
+    if isinstance(field, (list, tuple, set)):
+        return [_field_value(item) for item in field]
     if isinstance(field, dict):
         if "valueArray" in field and isinstance(field["valueArray"], list):
             return [_field_value(item) for item in field["valueArray"]]
@@ -514,6 +516,9 @@ def _first_value(value: Any) -> str:
 
 
 def _infer_title(markdown: str) -> str:
+    if not markdown.strip():
+        return ""
+
     for pattern in (r"^\s*#\s+(.+)$", r"^\s*title:\s*(.+)$"):
         match = re.search(pattern, markdown, flags=re.IGNORECASE | re.MULTILINE)
         if match:
@@ -523,7 +528,7 @@ def _infer_title(markdown: str) -> str:
         cleaned = _clean_text(line)
         if cleaned and len(cleaned) <= 120 and not cleaned.startswith("<!--"):
             return cleaned
-    return "Untitled Course"
+    return ""
 
 
 def _infer_topics(markdown: str) -> list[str]:

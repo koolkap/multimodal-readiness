@@ -19,7 +19,8 @@ Educational PDF or DOCX
 
 - Upload PDF and DOCX educational files.
 - Analyze content with Azure AI Content Understanding.
-- Extract course title, topics, concepts, learning objectives, and key terms.
+- Extract course title, instructor, course code, term, course structure, topics, concepts, learning objectives, key terms, and resources.
+- Supports the `coursebuilder` analyzer schema with fields such as `CourseTitle`, `InstructorName`, `CourseCode`, `Term`, `CourseStructure`, `BooksAndResources`, `ComputerFundamentals`, `HardwareFundamentals`, `MachineArchitectures`, `PrimitiveTypesInJava`, `ReferenceTypesAndClasses`, and `PointersAndReferences`.
 - Generate a 4 week course outline.
 - Generate lesson plan, quiz, assignment, mini project, and 10 slide presentation outline.
 - Show Plotly analytics for topic distribution, learning objective count, and difficulty breakdown.
@@ -61,6 +62,17 @@ CONTENTUNDERSTANDING_ANALYZER_ID=
 CONTENTUNDERSTANDING_API_VERSION=
 ```
 
+The app also accepts the variable names used in the Azure Content Understanding sample:
+
+```bash
+AZURE_CONTENT_UNDERSTANDING_ENDPOINT=
+CONTENT_UNDERSTANDING_KEY=
+CONTENT_UNDERSTANDING_ANALYZER_ID=
+API_VERSION=
+```
+
+`CONTENTUNDERSTANDING_API_VERSION` or `API_VERSION` is required. For your current sample, use `2025-11-01`.
+
 Do not commit `.env` files or API keys.
 
 ## Azure Setup
@@ -75,10 +87,60 @@ Do not commit `.env` files or API keys.
 1. Create or use a Microsoft Foundry resource with Content Understanding enabled.
 2. Configure required model deployment defaults for Content Understanding in the Foundry resource.
 3. Create or choose an analyzer and set `CONTENTUNDERSTANDING_ANALYZER_ID`.
-4. For general educational documents, `prebuilt-documentSearch` can extract markdown and semantic document content.
-5. For best structured extraction, use a custom analyzer with fields such as `CourseTitle`, `Topics`, `Concepts`, `LearningObjectives`, and `KeyTerms`.
+4. Set `CONTENTUNDERSTANDING_API_VERSION` or `API_VERSION`.
+5. For the provided schema, set `CONTENTUNDERSTANDING_ANALYZER_ID=coursebuilder`.
+
+The app supports this `coursebuilder` analyzer schema:
+
+```text
+CourseTitle
+InstructorName
+CourseCode
+Term
+CourseStructure.Parts
+CourseStructure.EmphasisLanguage
+JavaTicksRequirements
+BooksAndResources
+ComputerFundamentals
+HardwareFundamentals
+MachineArchitectures
+PrimitiveTypesInJava
+ReferenceTypesAndClasses
+PointersAndReferences
+```
+
+These fields are normalized into the app's canonical course knowledge object:
+
+```json
+{
+  "course_title": "",
+  "instructor_name": "",
+  "course_code": "",
+  "term": "",
+  "emphasis_language": "",
+  "topics": [],
+  "concepts": [],
+  "learning_objectives": [],
+  "key_terms": [],
+  "resources": [],
+  "analyzer_fields": {}
+}
+```
 
 The app also performs deterministic fallback extraction from Content Understanding markdown when custom fields are not available.
+
+## Streamlit Sidebar Configuration
+
+The sidebar shows these loaded settings:
+
+- Content Understanding Endpoint
+- Content Understanding Resource Key, masked
+- Analyzer ID
+- Content Understanding API Version
+- GPT Deployment
+- GPT API Version
+
+The key is intentionally masked so you can verify that a resource key loaded without exposing it on screen.
 
 ## Run Instructions
 
@@ -104,4 +166,3 @@ utils/
 requirements.txt
 README.md
 ```
-Workflow Agent 
