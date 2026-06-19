@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -164,11 +165,22 @@ class ContentUnderstandingService:
             poller = client.begin_analyze_binary(
                 analyzer_id=self.settings.analyzer_id,
                 binary_input=file_bytes,
+                content_type=detected_content_type,
             )
-            result = poller.result()
+            result = poller.result(timeout=90)
             return self._build_result(result, file_name, detected_content_type)
         except (InvalidContentError, EmptyContentUnderstandingResult):
             raise
+        except FuturesTimeoutError as exc:
+            operation_id = getattr(poller, "operation_id", None)
+            detail = (
+                "Azure AI Content Understanding analysis did not complete within 90 seconds. "
+                "This usually means the analyzer is still processing, the analyzer configuration is invalid, "
+                "or required model deployments/default mappings are missing in the Foundry resource."
+            )
+            if operation_id:
+                detail += f" Operation ID: {operation_id}."
+            raise AzureContentUnderstandingError(detail) from exc
         except HttpResponseError as exc:
             detail = getattr(exc, "message", None) or str(exc)
             raise AzureContentUnderstandingError(f"Azure Content Understanding request failed: {detail}") from exc

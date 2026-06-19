@@ -3,17 +3,18 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
+from urllib.parse import urlparse
 from typing import TypeVar
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, ValidationError
 
 try:
-    from openai import APIError, APITimeoutError, AzureOpenAI, OpenAIError
+    from openai import APIError, APITimeoutError, OpenAI, OpenAIError
 except ImportError:  # pragma: no cover - handled at runtime in Streamlit
     APIError = Exception
     APITimeoutError = Exception
-    AzureOpenAI = None
+    OpenAI = None
     OpenAIError = Exception
 
 
@@ -52,6 +53,23 @@ class AzureOpenAISettings:
         if not self.api_version:
             missing.append("AZURE_OPENAI_API_VERSION")
         return missing
+
+    def openai_base_url(self) -> str:
+        endpoint = self.endpoint.strip().rstrip("/")
+        if not endpoint:
+            return ""
+
+        if endpoint.endswith("/openai/v1"):
+            return endpoint + "/"
+
+        parsed = urlparse(endpoint)
+        if parsed.path.startswith("/api/projects/"):
+            return endpoint + "/openai/v1/"
+
+        if parsed.netloc.endswith(".openai.azure.com") or parsed.netloc.endswith(".services.ai.azure.com"):
+            return endpoint + "/openai/v1/"
+
+        return endpoint + "/openai/v1/"
 
 
 class CourseBuilderAgent:
@@ -106,18 +124,17 @@ class CourseBuilderAgent:
             raise GPTGenerationError(f"Azure OpenAI returned invalid JSON for {response_model.__name__}: {exc}") from exc
 
     def _ensure_ready(self) -> None:
-        if AzureOpenAI is None:
+        if OpenAI is None:
             raise GPTGenerationError("openai is not installed. Install requirements.txt first.")
         missing = self.settings.missing_required()
         if missing:
             raise GPTGenerationError("Missing Azure OpenAI configuration: " + ", ".join(missing))
 
-    def _client_instance(self) -> AzureOpenAI:
+    def _client_instance(self) -> OpenAI:
         if self._client is None:
-            self._client = AzureOpenAI(
-                azure_endpoint=self.settings.endpoint,
+            self._client = OpenAI(
+                base_url=self.settings.openai_base_url(),
                 api_key=self.settings.api_key,
-                api_version=self.settings.api_version,
             )
         return self._client
 
