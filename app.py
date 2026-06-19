@@ -94,13 +94,30 @@ def _render_sidebar(
         disabled=True,
     )
     st.sidebar.text_input(
+        "Content Understanding Key",
+        value=_masked_secret(cu_settings.key),
+        type="password",
+        disabled=True,
+        help="Loaded from CONTENTUNDERSTANDING_KEY, CONTENT_UNDERSTANDING_KEY, or Azure credential fallback.",
+    )
+    st.sidebar.text_input(
         "Analyzer ID",
         value=cu_settings.analyzer_id or "Not configured",
         disabled=True,
     )
     st.sidebar.text_input(
+        "Content Understanding API Version",
+        value=cu_settings.api_version or "Not configured",
+        disabled=True,
+    )
+    st.sidebar.text_input(
         "GPT Deployment",
         value=openai_settings.deployment or "Not configured",
+        disabled=True,
+    )
+    st.sidebar.text_input(
+        "GPT API Version",
+        value=openai_settings.api_version or "Not configured",
         disabled=True,
     )
 
@@ -127,7 +144,12 @@ def _render_upload_step(cu_settings: ContentUnderstandingSettings) -> None:
             return
 
         file_bytes = uploaded_file.getvalue()
-        analysis_hash = _analysis_hash(file_bytes, uploaded_file.name, cu_settings.analyzer_id)
+        analysis_hash = _analysis_hash(
+            file_bytes,
+            uploaded_file.name,
+            cu_settings.analyzer_id,
+            cu_settings.api_version,
+        )
         if (
             st.session_state.get("analysis_hash") == analysis_hash
             and st.session_state.get("content_understanding_result")
@@ -158,7 +180,26 @@ def _render_upload_step(cu_settings: ContentUnderstandingSettings) -> None:
 
 def _render_content_understanding_result(result: ContentUnderstandingResult) -> None:
     with st.expander("Content Understanding Result", expanded=True):
+        knowledge = result.extracted_knowledge
+        metadata = {
+            "course_title": knowledge.course_title,
+            "instructor_name": knowledge.instructor_name,
+            "course_code": knowledge.course_code,
+            "term": knowledge.term,
+            "emphasis_language": knowledge.emphasis_language,
+        }
+        metadata = {key: value for key, value in metadata.items() if value}
+        if metadata:
+            st.subheader("Course Metadata")
+            st.json(metadata)
+
+        st.subheader("Extracted Knowledge")
         st.json(result.extracted_knowledge.model_dump(mode="json"))
+
+        if result.analyzer_fields:
+            st.subheader("Analyzer Fields")
+            st.json(result.analyzer_fields)
+
         if result.warnings:
             st.warning("Warnings: " + "; ".join(result.warnings))
 
@@ -571,10 +612,16 @@ def _reset_learning_media() -> None:
     st.session_state["media_generation_key"] = None
 
 
-def _analysis_hash(file_bytes: bytes, file_name: str, analyzer_id: str) -> str:
+def _analysis_hash(
+    file_bytes: bytes,
+    file_name: str,
+    analyzer_id: str,
+    api_version: str | None,
+) -> str:
     digest = hashlib.sha256()
     digest.update(file_name.encode("utf-8"))
     digest.update(analyzer_id.encode("utf-8"))
+    digest.update((api_version or "").encode("utf-8"))
     digest.update(file_bytes)
     return digest.hexdigest()
 
@@ -586,6 +633,14 @@ def _generation_key(analysis_hash: str | None, settings: AzureOpenAISettings) ->
     digest.update(settings.deployment.encode("utf-8"))
     digest.update(settings.api_version.encode("utf-8"))
     return digest.hexdigest()
+
+
+def _masked_secret(value: str | None) -> str:
+    if not value:
+        return "Not configured"
+    if len(value) <= 8:
+        return "*" * len(value)
+    return f"{value[:4]}{'*' * 8}{value[-4:]}"
 
 
 if __name__ == "__main__":

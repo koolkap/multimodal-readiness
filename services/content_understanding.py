@@ -105,18 +105,38 @@ class ContentUnderstandingSettings:
     def from_env(cls) -> "ContentUnderstandingSettings":
         load_dotenv()
         return cls(
-            endpoint=os.getenv("CONTENTUNDERSTANDING_ENDPOINT", "").strip(),
-            key=os.getenv("CONTENTUNDERSTANDING_KEY", "").strip() or None,
-            analyzer_id=os.getenv("CONTENTUNDERSTANDING_ANALYZER_ID", "").strip(),
-            api_version=os.getenv("CONTENTUNDERSTANDING_API_VERSION", "").strip() or None,
+            endpoint=_first_env(
+                "CONTENTUNDERSTANDING_ENDPOINT",
+                "AZURE_CONTENT_UNDERSTANDING_ENDPOINT",
+            ),
+            key=_first_env(
+                "CONTENTUNDERSTANDING_KEY",
+                "CONTENT_UNDERSTANDING_KEY",
+                "AZURE_CONTENT_UNDERSTANDING_KEY",
+            )
+            or None,
+            analyzer_id=_first_env(
+                "CONTENTUNDERSTANDING_ANALYZER_ID",
+                "CONTENT_UNDERSTANDING_ANALYZER_ID",
+                "ANALYZER_ID",
+            ),
+            api_version=_first_env(
+                "CONTENTUNDERSTANDING_API_VERSION",
+                "CONTENT_UNDERSTANDING_API_VERSION",
+                "AZURE_CONTENT_UNDERSTANDING_API_VERSION",
+                "API_VERSION",
+            )
+            or None,
         )
 
     def missing_required(self) -> list[str]:
         missing = []
         if not self.endpoint:
-            missing.append("CONTENTUNDERSTANDING_ENDPOINT")
+            missing.append("CONTENTUNDERSTANDING_ENDPOINT or AZURE_CONTENT_UNDERSTANDING_ENDPOINT")
         if not self.analyzer_id:
             missing.append("CONTENTUNDERSTANDING_ANALYZER_ID")
+        if not self.api_version:
+            missing.append("CONTENTUNDERSTANDING_API_VERSION")
         return missing
 
 
@@ -258,26 +278,46 @@ def _extract_llm_ready_text(result: Any) -> str:
     return "\n\n".join(markdown_parts)
 
 
-def _extract_course_knowledge(result: Any, raw_result: dict[str, Any], markdown: str) -> CourseKnowledge:
-    field_values = _collect_field_values(result, raw_result)
-
+def _extract_course_knowledge(field_values: dict[str, Any], markdown: str) -> CourseKnowledge:
     course_title = _first_value(_lookup_field(field_values, FIELD_ALIASES["course_title"]))
+    instructor_name = _first_value(_lookup_field(field_values, FIELD_ALIASES["instructor_name"]))
+    course_code = _first_value(_lookup_field(field_values, FIELD_ALIASES["course_code"]))
+    term = _first_value(_lookup_field(field_values, FIELD_ALIASES["term"]))
+    emphasis_language = _first_value(_lookup_field(field_values, FIELD_ALIASES["emphasis_language"]))
+
     topics = _normalize_list(_lookup_field(field_values, FIELD_ALIASES["topics"]))
     concepts = _normalize_list(_lookup_field(field_values, FIELD_ALIASES["concepts"]))
     objectives = _normalize_list(_lookup_field(field_values, FIELD_ALIASES["learning_objectives"]))
     key_terms = _normalize_list(_lookup_field(field_values, FIELD_ALIASES["key_terms"]))
+    resources = _coursebuilder_resources(field_values)
+    coursebuilder_topics = _coursebuilder_topics(field_values)
+    coursebuilder_concepts = _coursebuilder_concepts(field_values)
+    coursebuilder_terms = _coursebuilder_key_terms(field_values)
 
     inferred_title = _infer_title(markdown)
     inferred_topics = _infer_topics(markdown)
     inferred_objectives = _infer_objectives(markdown)
     inferred_terms = _infer_key_terms(markdown)
+    synthesized_objectives = _synthesize_objectives(
+        topics + coursebuilder_topics + inferred_topics,
+        coursebuilder_concepts,
+    )
 
     return CourseKnowledge(
+        analyzer_fields=_top_level_fields(field_values),
         course_title=course_title or inferred_title,
-        topics=_dedupe(topics + inferred_topics, limit=12),
-        concepts=_dedupe(concepts + inferred_topics[1:] + inferred_terms[:8], limit=20),
-        learning_objectives=_dedupe(objectives + inferred_objectives, limit=12),
-        key_terms=_dedupe(key_terms + inferred_terms, limit=20),
+        instructor_name=instructor_name,
+        course_code=course_code,
+        term=term,
+        emphasis_language=emphasis_language,
+        topics=_dedupe(topics + coursebuilder_topics + inferred_topics, limit=16),
+        concepts=_dedupe(
+            concepts + coursebuilder_concepts + inferred_topics[1:] + inferred_terms[:8],
+            limit=32,
+        ),
+        learning_objectives=_dedupe(objectives + inferred_objectives + synthesized_objectives, limit=16),
+        key_terms=_dedupe(key_terms + coursebuilder_terms + inferred_terms, limit=32),
+        resources=_dedupe(resources, limit=24),
     )
 
 
@@ -289,7 +329,7 @@ def _collect_field_values(result: Any, raw_result: dict[str, Any]) -> dict[str, 
         fields = getattr(content, "fields", None)
         if isinstance(fields, dict):
             for key, value in fields.items():
-                collected[key] = _field_value(value)
+                _set_field(collected, key, _field_value(value))
 
     raw_contents = raw_result.get("contents", [])
     if not raw_contents and isinstance(raw_result.get("result"), dict):
@@ -298,13 +338,14 @@ def _collect_field_values(result: Any, raw_result: dict[str, Any]) -> dict[str, 
     for content in raw_contents or []:
         fields = content.get("fields", {}) if isinstance(content, dict) else {}
         for key, value in fields.items():
-            collected.setdefault(key, _field_value(value))
+            if key not in collected:
+                _set_field(collected, key, _field_value(value))
 
     return collected
 
 
 def _lookup_field(fields: dict[str, Any], aliases: list[str]) -> Any:
-    normalized = {_normalize_key(key): value for key, value in fields.items()}
+    normalized = {_normalize_key(key): value for key, value in _flatten_fields(fields).items()}
     for alias in aliases:
         value = normalized.get(_normalize_key(alias))
         if value not in (None, "", [], {}):
@@ -318,6 +359,10 @@ def _field_value(field: Any) -> Any:
     if isinstance(field, (str, int, float, bool, list, tuple)):
         return field
     if isinstance(field, dict):
+        if "valueArray" in field and isinstance(field["valueArray"], list):
+            return [_field_value(item) for item in field["valueArray"]]
+        if "valueObject" in field and isinstance(field["valueObject"], dict):
+            return {key: _field_value(value) for key, value in field["valueObject"].items()}
         for key in (
             "value",
             "valueString",
@@ -342,6 +387,101 @@ def _field_value(field: Any) -> Any:
         if hasattr(field, attr):
             return _field_value(getattr(field, attr))
     return str(field)
+
+
+def _set_field(target: dict[str, Any], key: str, value: Any) -> None:
+    target[key] = value
+    if isinstance(value, dict):
+        for child_key, child_value in value.items():
+            target[f"{key}.{child_key}"] = child_value
+
+
+def _flatten_fields(fields: dict[str, Any], prefix: str = "") -> dict[str, Any]:
+    flattened: dict[str, Any] = {}
+    for key, value in fields.items():
+        path = f"{prefix}.{key}" if prefix else key
+        flattened[path] = value
+        if isinstance(value, dict):
+            flattened.update(_flatten_fields(value, path))
+    return flattened
+
+
+def _top_level_fields(fields: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in fields.items()
+        if "." not in key and value not in (None, "", [], {})
+    }
+
+
+def _coursebuilder_topics(fields: dict[str, Any]) -> list[str]:
+    topics = _normalize_list(_lookup_field(fields, ["CourseStructure.Parts", "Parts"]))
+    topics.extend(_humanize_name(field_name) for field_name in COURSEBUILDER_CONCEPT_FIELDS if _field_exists(fields, field_name))
+    emphasis_language = _first_value(_lookup_field(fields, ["CourseStructure.EmphasisLanguage"]))
+    if emphasis_language:
+        topics.append(f"{emphasis_language} programming")
+    return _dedupe(topics, limit=16)
+
+
+def _coursebuilder_concepts(fields: dict[str, Any]) -> list[str]:
+    concepts: list[str] = []
+    for field_name in COURSEBUILDER_CONCEPT_FIELDS:
+        field_value = _lookup_field(fields, [field_name])
+        if field_value not in (None, "", [], {}):
+            concepts.append(_humanize_name(field_name))
+            concepts.extend(_section_values(field_name, field_value))
+    return _dedupe(concepts, limit=40)
+
+
+def _coursebuilder_key_terms(fields: dict[str, Any]) -> list[str]:
+    terms: list[str] = []
+    for field_name in COURSEBUILDER_CONCEPT_FIELDS:
+        field_value = _lookup_field(fields, [field_name])
+        if isinstance(field_value, dict):
+            terms.extend(_humanize_name(key) for key in field_value)
+        elif field_value not in (None, "", [], {}):
+            terms.append(_humanize_name(field_name))
+    return _dedupe(terms, limit=32)
+
+
+def _coursebuilder_resources(fields: dict[str, Any]) -> list[str]:
+    resources: list[str] = []
+    for field_path in COURSEBUILDER_RESOURCE_FIELDS:
+        resources.extend(_normalize_list(_lookup_field(fields, [field_path])))
+    return _dedupe(resources, limit=24)
+
+
+def _section_values(section_name: str, value: Any) -> list[str]:
+    values: list[str] = []
+    if isinstance(value, dict):
+        for key, child_value in value.items():
+            label = _humanize_name(key)
+            if isinstance(child_value, (dict, list, tuple, set)):
+                for item in _normalize_list(child_value):
+                    values.append(f"{label}: {item}")
+            else:
+                item = _first_value(child_value)
+                if item:
+                    values.append(f"{label}: {item}")
+    else:
+        values.extend(_normalize_list(value))
+
+    if not values:
+        values.append(_humanize_name(section_name))
+    return values
+
+
+def _synthesize_objectives(topics: list[str], concepts: list[str]) -> list[str]:
+    source_items = _dedupe(topics + concepts, limit=8)
+    objectives = []
+    for item in source_items[:6]:
+        objectives.append(f"Explain and apply {item} in an educational or practical context")
+    return objectives
+
+
+def _field_exists(fields: dict[str, Any], field_name: str) -> bool:
+    value = _lookup_field(fields, [field_name])
+    return value not in (None, "", [], {})
 
 
 def _normalize_list(value: Any) -> list[str]:
@@ -450,8 +590,23 @@ def _clean_text(value: str) -> str:
     return value.strip()
 
 
+def _humanize_name(value: str) -> str:
+    value = value.split(".")[-1]
+    value = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", value)
+    value = value.replace("_", " ").replace("-", " ")
+    return _clean_text(value)
+
+
 def _normalize_key(value: str) -> str:
     return re.sub(r"[^a-z0-9]", "", value.lower())
+
+
+def _first_env(*names: str) -> str:
+    for name in names:
+        value = os.getenv(name, "").strip()
+        if value:
+            return value
+    return ""
 
 
 def _to_plain_data(value: Any) -> Any:
