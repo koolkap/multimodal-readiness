@@ -31,7 +31,23 @@ SUPPORTED_EXTENSIONS = {
 
 FIELD_ALIASES = {
     "course_title": ["course_title", "CourseTitle", "title", "Title", "DocumentTitle"],
-    "topics": ["topics", "Topics", "course_topics", "CourseTopics"],
+    "instructor_name": ["instructor_name", "InstructorName", "Instructor", "Lecturer"],
+    "course_code": ["course_code", "CourseCode", "Code", "CourseIdentifier"],
+    "term": ["term", "Term", "AcademicTerm", "Year"],
+    "emphasis_language": [
+        "emphasis_language",
+        "EmphasisLanguage",
+        "CourseStructure.EmphasisLanguage",
+        "ProgrammingLanguage",
+    ],
+    "topics": [
+        "topics",
+        "Topics",
+        "course_topics",
+        "CourseTopics",
+        "CourseStructure.Parts",
+        "Parts",
+    ],
     "concepts": ["concepts", "Concepts", "core_concepts", "CoreConcepts"],
     "learning_objectives": [
         "learning_objectives",
@@ -43,6 +59,23 @@ FIELD_ALIASES = {
     ],
     "key_terms": ["key_terms", "KeyTerms", "terms", "Terms", "glossary", "Glossary"],
 }
+
+COURSEBUILDER_CONCEPT_FIELDS = [
+    "ComputerFundamentals",
+    "HardwareFundamentals",
+    "MachineArchitectures",
+    "PrimitiveTypesInJava",
+    "ReferenceTypesAndClasses",
+    "PointersAndReferences",
+]
+
+COURSEBUILDER_RESOURCE_FIELDS = [
+    "BooksAndResources.OopBooks",
+    "BooksAndResources.JavaBooks",
+    "BooksAndResources.DesignPatternsBooks",
+    "BooksAndResources.WebResources",
+    "BooksAndResources.CourseWebPageUrl",
+]
 
 
 class ContentUnderstandingError(Exception):
@@ -184,7 +217,8 @@ class ContentUnderstandingService:
     ) -> ContentUnderstandingResult:
         raw_result = _to_plain_data(result)
         markdown = _extract_llm_ready_text(result)
-        knowledge = _extract_course_knowledge(result, raw_result, markdown)
+        analyzer_fields = _collect_field_values(result, raw_result)
+        knowledge = _extract_course_knowledge(analyzer_fields, markdown)
         warnings = _normalize_list(raw_result.get("warnings", []))
         usage = raw_result.get("usage") if isinstance(raw_result.get("usage"), dict) else {}
 
@@ -199,6 +233,7 @@ class ContentUnderstandingService:
             analyzer_id=self.settings.analyzer_id,
             markdown=markdown,
             extracted_knowledge=knowledge,
+            analyzer_fields=_top_level_fields(analyzer_fields),
             raw_result=raw_result,
             warnings=warnings,
             usage=usage,

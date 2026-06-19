@@ -11,10 +11,16 @@ class AppModel(BaseModel):
 
 class CourseKnowledge(AppModel):
     course_title: str = ""
+    instructor_name: str = ""
+    course_code: str = ""
+    term: str = ""
+    emphasis_language: str = ""
     topics: list[str] = Field(default_factory=list)
     concepts: list[str] = Field(default_factory=list)
     learning_objectives: list[str] = Field(default_factory=list)
     key_terms: list[str] = Field(default_factory=list)
+    resources: list[str] = Field(default_factory=list)
+    analyzer_fields: dict[str, Any] = Field(default_factory=dict)
 
     def is_empty(self) -> bool:
         return not any(
@@ -24,6 +30,8 @@ class CourseKnowledge(AppModel):
                 self.concepts,
                 self.learning_objectives,
                 self.key_terms,
+                self.resources,
+                self.analyzer_fields,
             ]
         )
 
@@ -34,6 +42,7 @@ class ContentUnderstandingResult(AppModel):
     analyzer_id: str
     markdown: str = ""
     extracted_knowledge: CourseKnowledge = Field(default_factory=CourseKnowledge)
+    analyzer_fields: dict[str, Any] = Field(default_factory=dict)
     raw_result: dict[str, Any] = Field(default_factory=dict)
     warnings: list[str] = Field(default_factory=list)
     usage: dict[str, Any] = Field(default_factory=dict)
