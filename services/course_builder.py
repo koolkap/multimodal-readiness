@@ -3,11 +3,17 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 from typing import TypeVar
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, ValidationError
+
+try:
+    from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+except ImportError:  # pragma: no cover - azure-identity is in requirements
+    DefaultAzureCredential = None
+    get_bearer_token_provider = None
 
 try:
     from openai import APIError, APITimeoutError, OpenAI, OpenAIError
@@ -28,9 +34,10 @@ class GPTGenerationError(Exception):
 @dataclass(frozen=True)
 class AzureOpenAISettings:
     endpoint: str
-    api_key: str
+    api_key: str = ""
     deployment: str
-    api_version: str
+    api_version: str = ""
+    auth_method: str = ""
 
     @classmethod
     def from_env(cls) -> "AzureOpenAISettings":
@@ -40,34 +47,48 @@ class AzureOpenAISettings:
             api_key=os.getenv("AZURE_OPENAI_API_KEY", "").strip(),
             deployment=os.getenv("AZURE_OPENAI_DEPLOYMENT", "").strip(),
             api_version=os.getenv("AZURE_OPENAI_API_VERSION", "").strip(),
+            auth_method=os.getenv("AZURE_OPENAI_AUTH_METHOD", "").strip().lower(),
         )
 
     def missing_required(self) -> list[str]:
         missing = []
         if not self.endpoint:
             missing.append("AZURE_OPENAI_ENDPOINT")
-        if not self.api_key:
+        if self.uses_api_key_auth() and not self.api_key:
             missing.append("AZURE_OPENAI_API_KEY")
         if not self.deployment:
             missing.append("AZURE_OPENAI_DEPLOYMENT")
-        if not self.api_version:
-            missing.append("AZURE_OPENAI_API_VERSION")
+        if self.uses_entra_auth() and (DefaultAzureCredential is None or get_bearer_token_provider is None):
+            missing.append("azure-identity")
         return missing
+
+    def uses_entra_auth(self) -> bool:
+        return self.auth_method in {
+            "aad",
+            "azure_ad",
+            "default_azure_credential",
+            "entra",
+            "entra_id",
+            "managed_identity",
+        }
+
+    def uses_api_key_auth(self) -> bool:
+        return not self.uses_entra_auth()
 
     def openai_base_url(self) -> str:
         endpoint = self.endpoint.strip().rstrip("/")
         if not endpoint:
             return ""
 
-        if endpoint.endswith("/openai/v1"):
+        parsed = urlparse(endpoint)
+        path = parsed.path.rstrip("/")
+        root = urlunparse((parsed.scheme, parsed.netloc, "", "", "", "")).rstrip("/")
+
+        if path.endswith("/openai/v1"):
             return endpoint + "/"
 
-        parsed = urlparse(endpoint)
-        if parsed.path.startswith("/api/projects/"):
-            return endpoint + "/openai/v1/"
-
         if parsed.netloc.endswith(".openai.azure.com") or parsed.netloc.endswith(".services.ai.azure.com"):
-            return endpoint + "/openai/v1/"
+            return root + "/openai/v1/"
 
         return endpoint + "/openai/v1/"
 
@@ -76,6 +97,7 @@ class CourseBuilderAgent:
     def __init__(self, settings: AzureOpenAISettings | None = None) -> None:
         self.settings = settings or AzureOpenAISettings.from_env()
         self._client = None
+        self._credential = None
 
     def generate_structured(
         self,
@@ -132,10 +154,17 @@ class CourseBuilderAgent:
 
     def _client_instance(self) -> OpenAI:
         if self._client is None:
-            self._client = OpenAI(
-                base_url=self.settings.openai_base_url(),
-                api_key=self.settings.api_key,
-            )
+            kwargs = {"base_url": self.settings.openai_base_url()}
+            if self.settings.uses_entra_auth():
+                self._credential = DefaultAzureCredential()
+                kwargs["api_key"] = get_bearer_token_provider(
+                    self._credential,
+                    "https://ai.azure.com/.default",
+                )
+            else:
+                kwargs["api_key"] = "unused"
+                kwargs["default_headers"] = {"api-key": self.settings.api_key}
+            self._client = OpenAI(**kwargs)
         return self._client
 
     def _chat_completion(
