@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -10,12 +11,15 @@ from dotenv import load_dotenv
 
 from models.course_models import ContentUnderstandingResult, CourseKnowledge
 
+CONTENT_UNDERSTANDING_IMPORT_ERROR: str | None = None
+
 try:
     from azure.ai.contentunderstanding import ContentUnderstandingClient, to_llm_input
     from azure.core.credentials import AzureKeyCredential
     from azure.core.exceptions import AzureError, HttpResponseError
     from azure.identity import DefaultAzureCredential
 except ImportError:  # pragma: no cover - handled at runtime in Streamlit
+    CONTENT_UNDERSTANDING_IMPORT_ERROR = str(sys.exc_info()[1])
     ContentUnderstandingClient = None
     to_llm_input = None
     AzureKeyCredential = None
@@ -180,8 +184,10 @@ class ContentUnderstandingService:
 
     def _ensure_ready(self) -> None:
         if ContentUnderstandingClient is None:
+            detail = CONTENT_UNDERSTANDING_IMPORT_ERROR or "unknown import error"
             raise ContentUnderstandingError(
-                "azure-ai-contentunderstanding is not installed. Install requirements.txt first."
+                "Azure AI Content Understanding could not be imported in the active Python environment. "
+                f"Interpreter: {sys.executable}. Import error: {detail}"
             )
         missing = self.settings.missing_required()
         if missing:

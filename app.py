@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 from typing import Any
 
 import plotly.express as px
@@ -21,6 +22,7 @@ from models.course_models import (
 )
 from services.content_understanding import (
     AzureContentUnderstandingError,
+    CONTENT_UNDERSTANDING_IMPORT_ERROR,
     ContentUnderstandingError,
     ContentUnderstandingService,
     ContentUnderstandingSettings,
@@ -88,6 +90,7 @@ def _render_sidebar(
 ) -> None:
     st.sidebar.header("Azure Configuration")
     st.sidebar.caption("Loaded from environment variables or .env.")
+    st.sidebar.caption(f"Python: {sys.executable}")
     st.sidebar.text_input(
         "Content Understanding Endpoint",
         value=cu_settings.endpoint or "Not configured",
@@ -127,6 +130,11 @@ def _render_sidebar(
         st.sidebar.warning("Missing Content Understanding settings: " + ", ".join(cu_missing))
     if gpt_missing:
         st.sidebar.warning("Missing Azure OpenAI settings: " + ", ".join(gpt_missing))
+    if CONTENT_UNDERSTANDING_IMPORT_ERROR:
+        st.sidebar.error(
+            "Content Understanding import failed in this interpreter: "
+            f"{CONTENT_UNDERSTANDING_IMPORT_ERROR}"
+        )
 
 
 def _render_upload_step(cu_settings: ContentUnderstandingSettings) -> None:
