@@ -1,0 +1,8 @@
+streamlit>=1.37.0
+azure-ai-contentunderstanding>=1.2.0b1
+azure-core>=1.30.0
+azure-identity>=1.17.0
+openai>=1.42.0
+python-dotenv>=1.0.1
+pydantic>=2.8.0
+plotly>=5.24.0
